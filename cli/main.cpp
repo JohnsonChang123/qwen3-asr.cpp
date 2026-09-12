@@ -11,6 +11,8 @@
 #include <clocale>
 #include <string>
 #include <fstream>
+#include <chrono>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -35,6 +37,13 @@ struct cli_params {
     bool transcribe_align_mode = false;
     bool profile = false;
     bool output_srt = false;
+
+    // streaming (defaults = Qwen3-ASR Technical Report section 4.5)
+    bool  stream_mode           = false;
+    float stream_chunk_sec      = 2.0f;
+    int   stream_unfixed_tokens = 5;
+    int   stream_unfixed_chunks = 2;
+    int   stream_max_windows    = 4;
 };
 
 static void print_usage(const char * prog) {
@@ -53,6 +62,11 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  --profile              Print detailed timing profile (requires QWEN3_ASR_TIMING build)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Forced Alignment:\n");
+    fprintf(stderr, "  --stream               Streaming mode: feed the file in chunks, decode incrementally\n");
+    fprintf(stderr, "  --chunk-sec <f>        Streaming chunk size in seconds (default: 2.0)\n");
+    fprintf(stderr, "  --unfixed-tokens <n>   Tokens rolled back each step (default: 5)\n");
+    fprintf(stderr, "  --unfixed-chunks <n>   Cold-start chunks with no text prefix (default: 2)\n");
+    fprintf(stderr, "  --max-windows <n>      Encoder windows kept; 1 window = 8s (default: 4)\n");
     fprintf(stderr, "  --align                Enable forced alignment mode\n");
     fprintf(stderr, "  --text <text>          Reference transcript for alignment\n");
     fprintf(stderr, "\n");
@@ -124,6 +138,20 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
             params.print_tokens = true;
         } else if (strcmp(arg, "--profile") == 0) {
             params.profile = true;
+        } else if (strcmp(arg, "--stream") == 0) {
+            params.stream_mode = true;
+        } else if (strcmp(arg, "--chunk-sec") == 0) {
+            if (++i >= argc) return false;
+            params.stream_chunk_sec = (float)atof(argv[i]);
+        } else if (strcmp(arg, "--unfixed-tokens") == 0) {
+            if (++i >= argc) return false;
+            params.stream_unfixed_tokens = atoi(argv[i]);
+        } else if (strcmp(arg, "--unfixed-chunks") == 0) {
+            if (++i >= argc) return false;
+            params.stream_unfixed_chunks = atoi(argv[i]);
+        } else if (strcmp(arg, "--max-windows") == 0) {
+            if (++i >= argc) return false;
+            params.stream_max_windows = atoi(argv[i]);
         } else if (strcmp(arg, "--align") == 0) {
             params.align_mode = true;
         } else if (strcmp(arg, "-osrt") == 0 || strcmp(arg, "--output-srt") == 0) {
@@ -476,6 +504,114 @@ static int run_alignment(const cli_params & params) {
     return 0;
 }
 
+static int64_t stream_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Drive the streaming API from a WAV file, feeding it in fixed chunks the way a
+// live source would. Not paced to real time -- this measures the model and the
+// caching, not the wall clock a listener experiences.
+static int run_streaming(const cli_params & params) {
+    fprintf(stderr, "qwen3-asr-cli  [streaming]\n");
+    fprintf(stderr, "  Model: %s\n", params.model_path.c_str());
+    fprintf(stderr, "  Audio: %s\n", params.audio_path.c_str());
+    fprintf(stderr, "  Chunk: %.2fs   rollback: %d tok   cold start: %d chunks   window cache: %d\n",
+            params.stream_chunk_sec, params.stream_unfixed_tokens,
+            params.stream_unfixed_chunks, params.stream_max_windows);
+    fprintf(stderr, "\n");
+
+    qwen3_asr::Qwen3ASR asr;
+    if (!asr.load_model(params.model_path)) {
+        fprintf(stderr, "Error: %s\n", asr.get_error().c_str());
+        return 1;
+    }
+
+    std::vector<float> samples;
+    int sample_rate = 0;
+    if (!qwen3_asr::load_audio_file(params.audio_path, samples, sample_rate)) {
+        fprintf(stderr, "Error: Failed to load audio file: %s\n", params.audio_path.c_str());
+        return 1;
+    }
+    if (sample_rate != 16000) {
+        fprintf(stderr, "Error: Audio must be 16kHz, got %d Hz\n", sample_rate);
+        return 1;
+    }
+
+    qwen3_asr::streaming_params sp;
+    sp.chunk_size_sec      = params.stream_chunk_sec;
+    sp.unfixed_token_num   = params.stream_unfixed_tokens;
+    sp.unfixed_chunk_num   = params.stream_unfixed_chunks;
+    sp.max_cached_windows  = params.stream_max_windows;
+    sp.n_threads           = params.n_threads;
+    sp.language            = params.language;
+
+    qwen3_asr::streaming_state st;
+    asr.init_streaming(st, sp);
+
+    const int chunk_samples = std::max(1, (int)(sp.chunk_size_sec * 16000.0f));
+    const int total         = (int)samples.size();
+
+    const int64_t t_start = stream_now_ms();
+    int pos  = 0;
+    int step = 0;
+
+    while (pos < total) {
+        const int n = std::min(chunk_samples, total - pos);
+
+        const int64_t t0 = stream_now_ms();
+        if (!asr.feed_audio(st, samples.data() + pos, n)) {
+            fprintf(stderr, "Error: %s\n", asr.get_error().c_str());
+            return 1;
+        }
+        const int64_t dt = stream_now_ms() - t0;
+
+        pos += n;
+        step++;
+
+        fprintf(stderr, "[%3d] %6.1fs  %5lldms  mel %lld / enc %lld / dec %lld  win %d(+%d dropped)\n",
+                step, pos / 16000.0, (long long)dt,
+                (long long)st.t_mel_ms, (long long)st.t_encode_ms, (long long)st.t_decode_ms,
+                st.n_windows_cached - st.n_windows_dropped, st.n_windows_dropped);
+        fprintf(stderr, "      %s\n", st.text.c_str());
+    }
+
+    const int64_t t_final0 = stream_now_ms();
+    if (!asr.finish_streaming(st)) {
+        fprintf(stderr, "Error: %s\n", asr.get_error().c_str());
+        return 1;
+    }
+    const int64_t t_final = stream_now_ms() - t_final0;
+    const int64_t t_all   = stream_now_ms() - t_start;
+
+    const double audio_sec = total / 16000.0;
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  steps          : %d  (final pass %lldms)\n", step, (long long)t_final);
+    fprintf(stderr, "  windows        : %d cached, %d dropped\n",
+            st.n_windows_cached, st.n_windows_dropped);
+    fprintf(stderr, "  audio / wall   : %.1fs / %.1fs = %.2fx realtime\n",
+            audio_sec, t_all / 1000.0, audio_sec / (t_all / 1000.0));
+    fprintf(stderr, "\n");
+
+    if (params.output_path.empty()) {
+        printf("%s\n", st.text.c_str());
+    } else {
+        std::ofstream out(params.output_path);
+        if (!out) {
+            fprintf(stderr, "Error: Failed to open output file: %s\n", params.output_path.c_str());
+            return 1;
+        }
+        out << st.text << "\n";
+        fprintf(stderr, "Output written to: %s\n", params.output_path.c_str());
+    }
+
+    if (params.profile) {
+        QWEN3_TIMER_REPORT();
+    }
+
+    return 0;
+}
+
 static int run_transcription(const cli_params & params) {
     fprintf(stderr, "qwen3-asr-cli\n");
     fprintf(stderr, "  Model: %s\n", params.model_path.c_str());
@@ -710,6 +846,10 @@ int main(int argc, char ** argv) {
     
     if (params.transcribe_align_mode) {
         return run_transcribe_and_align(params);
+    }
+
+    if (params.stream_mode) {
+        return run_streaming(params);
     }
 
     if (params.align_mode) {

@@ -16,6 +16,14 @@ static int64_t get_time_ms() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Index of the first <|audio_pad|> token in the chat template built by
+// build_input_tokens(): <|im_start|>system \n <|im_end|> \n <|im_start|> user \n
+// <|audio_start|> is 9 tokens, so the audio embeddings are injected from there.
+static constexpr int32_t kAudioPadStartPos = 9;
+
+// The model emits a two-token language marker before any transcript text.
+static constexpr size_t kLanguagePrefixTokens = 2;
+
 Qwen3ASR::Qwen3ASR() = default;
 Qwen3ASR::~Qwen3ASR() = default;
 
@@ -307,6 +315,292 @@ int32_t Qwen3ASR::sample_greedy(const float * logits, int32_t vocab_size) {
 
 void Qwen3ASR::set_progress_callback(progress_callback_t callback) {
     progress_callback_ = std::move(callback);
+}
+
+// ===========================================================================
+// Streaming
+//
+// One step = one call to streaming_step(), which does four things in order:
+//   1. mel      -- recompute the spectrogram over the retained audio
+//   2. encode   -- reuse cached windows, re-encode only the partial tail window
+//   3. decode   -- rebuild the prompt and greedily generate
+//   4. commit   -- splice the new tokens onto the settled ones, then evict
+//
+// Each is a helper below; streaming_step() is only the sequencing.
+// ===========================================================================
+
+namespace {
+
+// What the decoder gets to see this step, and how much of the previous output
+// survives it.
+struct decoder_context {
+    std::vector<int32_t> prompt_prefix;   // text tokens appended to the prompt
+    int32_t              n_settled = 0;   // prev_tokens[0, n_settled) are kept as-is
+};
+
+// The last `rollback` tokens of the previous output are treated as unstable and are
+// re-decoded this step; everything before them is settled.
+//
+// Only the last `max_prefix_tokens` settled tokens are shown to the model. The rest
+// stay in prev_tokens, so bounding the decoder's context never truncates the
+// transcript -- it only limits how far back the model can see.
+decoder_context plan_decoder_context(const qwen3_asr::streaming_state & st, int32_t rollback) {
+    decoder_context ctx;
+
+    const int32_t n_prev = (int32_t) st.prev_tokens.size();
+    if (n_prev == 0) {
+        return ctx;
+    }
+
+    // Cold start deliberately discards the previous output and re-transcribes the whole
+    // buffer, which sharpens the first couple of chunks. That is only sound while every
+    // sample is still buffered: once a window has been evicted its audio is gone for
+    // good, so from then on the transcript must always be carried forward.
+    const bool all_audio_retained = st.n_windows_dropped == 0;
+    const bool cold_start         = st.n_chunks_fed < st.params.unfixed_chunk_num;
+    if (cold_start && all_audio_retained) {
+        return ctx;
+    }
+
+    ctx.n_settled = std::max(0, n_prev - rollback);
+
+    const int32_t prefix_begin = std::max(0, ctx.n_settled - st.params.max_prefix_tokens);
+    ctx.prompt_prefix.assign(st.prev_tokens.begin() + prefix_begin,
+                             st.prev_tokens.begin() + ctx.n_settled);
+    return ctx;
+}
+
+}  // namespace
+
+void Qwen3ASR::init_streaming(streaming_state & st, const streaming_params & params) {
+    st = streaming_state();
+    st.params = params;
+}
+
+bool Qwen3ASR::feed_audio(streaming_state & st, const float * samples, int n_samples) {
+    if (!model_loaded_) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+    if (st.finished) {
+        error_msg_ = "Streaming session already finished";
+        return false;
+    }
+    if (samples != nullptr && n_samples > 0) {
+        st.audio.insert(st.audio.end(), samples, samples + n_samples);
+    }
+    return streaming_step(st);
+}
+
+bool Qwen3ASR::finish_streaming(streaming_state & st) {
+    if (!model_loaded_) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+    if (st.finished) {
+        return true;
+    }
+
+    // A normal step, deliberately: it rolls the unstable tail back and re-decodes it
+    // with the complete audio, which is the last chance to revise those tokens. Running
+    // the final pass with rollback disabled would freeze them and let it only append.
+    if (!streaming_step(st)) {
+        return false;
+    }
+    st.finished = true;
+    return true;
+}
+
+// Encoder features for the whole retained buffer: cached windows verbatim, plus the
+// partial tail window re-encoded from scratch.
+//
+// A completed window is final under the model's block-diagonal windowed attention, so
+// it is encoded once and never revisited. Only the tail -- at most one window -- is
+// recomputed per step.
+bool Qwen3ASR::stream_encode_features(streaming_state & st, const MelSpectrogram & mel,
+                                      std::vector<float> & features) {
+    const int mel_frames_per_window = encoder_.window_mel_frames();
+    const int n_complete_windows    = mel.n_len / mel_frames_per_window;
+    const int first_uncached_window = st.n_windows_cached - st.n_windows_dropped;
+
+    {
+        QWEN3_TIMER("streaming.encode_new_windows");
+        for (int w = first_uncached_window; w < n_complete_windows; ++w) {
+            std::vector<float> window_features;
+            if (!encoder_.encode_window_from_mel(mel.data.data(), mel.n_mel, mel.n_len,
+                                                 w * mel_frames_per_window,
+                                                 mel_frames_per_window, window_features)) {
+                error_msg_ = "Failed to encode window: " + encoder_.get_error();
+                return false;
+            }
+            st.win_cache.insert(st.win_cache.end(), window_features.begin(), window_features.end());
+            st.n_windows_cached++;
+        }
+    }
+
+    features = st.win_cache;
+
+    const int tail_begin  = n_complete_windows * mel_frames_per_window;
+    const int tail_frames = mel.n_len - tail_begin;
+    if (tail_frames > 0) {
+        QWEN3_TIMER("streaming.encode_tail");
+        std::vector<float> tail_features;
+        if (!encoder_.encode_window_from_mel(mel.data.data(), mel.n_mel, mel.n_len,
+                                             tail_begin, tail_frames, tail_features)) {
+            error_msg_ = "Failed to encode tail window: " + encoder_.get_error();
+            return false;
+        }
+        features.insert(features.end(), tail_features.begin(), tail_features.end());
+    }
+
+    return true;
+}
+
+// Greedy decode of one step. Returns only the NEWLY generated tokens; splicing them
+// onto the settled ones is the caller's job.
+//
+// The audio_pad count grows every step, so every later token shifts position and the KV
+// cache cannot carry over. Rebuilding it per step is forced by the model carrying audio
+// in the prompt rather than in cross-attention.
+bool Qwen3ASR::stream_generate(streaming_state & st,
+                               const std::vector<float> & features, int32_t n_audio_frames,
+                               const std::vector<int32_t> & prompt_prefix,
+                               std::vector<int32_t> & generated) {
+    const auto & cfg = decoder_.get_config();
+
+    std::vector<int32_t> prompt = build_input_tokens(n_audio_frames, st.params.language);
+    prompt.insert(prompt.end(), prompt_prefix.begin(), prompt_prefix.end());
+
+    if (!decoder_.init_kv_cache((int32_t) prompt.size() + st.params.max_new_tokens)) {
+        error_msg_ = "Failed to initialize KV cache: " + decoder_.get_error();
+        return false;
+    }
+
+    std::vector<float> logits;
+    {
+        QWEN3_TIMER("streaming.decode_prefill");
+        if (!decoder_.forward_with_audio(prompt.data(), (int32_t) prompt.size(),
+                                         features.data(), n_audio_frames,
+                                         /*audio_start_pos=*/kAudioPadStartPos,
+                                         /*n_past=*/0, logits)) {
+            error_msg_ = "Streaming prefill failed: " + decoder_.get_error();
+            return false;
+        }
+    }
+
+    generated.clear();
+    int32_t n_past = (int32_t) prompt.size();
+    int32_t next   = sample_greedy(logits.data(), cfg.vocab_size);
+
+    {
+        QWEN3_TIMER("streaming.decode_loop");
+        while (next != cfg.eos_token_id && (int32_t) generated.size() < st.params.max_new_tokens) {
+            generated.push_back(next);
+            if (!decoder_.forward(&next, 1, n_past, logits)) {
+                error_msg_ = "Streaming decode failed: " + decoder_.get_error();
+                return false;
+            }
+            n_past += 1;
+            next = sample_greedy(logits.data(), cfg.vocab_size);
+        }
+    }
+
+    return true;
+}
+
+// Drop the oldest cached windows, and the audio behind them, until the encoder context
+// is back within max_cached_windows. Features and samples are dropped together so
+// n_windows_dropped stays a valid index into both.
+void Qwen3ASR::stream_evict_windows(streaming_state & st, int32_t hidden_size) {
+    const size_t features_per_window = (size_t) encoder_.window_tokens() * (size_t) hidden_size;
+    const int    samples_per_window  = encoder_.window_mel_frames() * QWEN_HOP_LENGTH;
+
+    while (st.n_windows_cached - st.n_windows_dropped > st.params.max_cached_windows) {
+        if (st.win_cache.size() < features_per_window || (int) st.audio.size() <= samples_per_window) {
+            break;
+        }
+        st.win_cache.erase(st.win_cache.begin(), st.win_cache.begin() + features_per_window);
+        st.audio.erase(st.audio.begin(), st.audio.begin() + samples_per_window);
+        st.n_windows_dropped++;
+    }
+}
+
+// Rebuild st.text from the token history. prev_tokens[0] and [1] are the language
+// marker the model emits before any transcript.
+void Qwen3ASR::stream_publish_text(streaming_state & st) {
+    const size_t text_begin = std::min<size_t>(st.prev_tokens.size(), kLanguagePrefixTokens);
+    st.text = decoder_.decode_tokens(
+        std::vector<int32_t>(st.prev_tokens.begin() + text_begin, st.prev_tokens.end()));
+
+    if (st.prev_tokens.size() >= kLanguagePrefixTokens) {
+        st.language = decoder_.decode_token(st.prev_tokens[1]);
+    }
+}
+
+bool Qwen3ASR::streaming_step(streaming_state & st) {
+    if (st.audio.empty()) {
+        return true;
+    }
+
+    encoder_.set_n_threads(st.params.n_threads);
+    decoder_.set_n_threads(st.params.n_threads);
+
+    // --- 1. mel ---------------------------------------------------------------
+    // Recomputed in full every step. A frame only depends on its own 400-sample window,
+    // so every frame but the last is bit-identical to the previous step, and the ones
+    // that do move all sit inside the tail window, which is re-encoded anyway.
+    int64_t t0 = get_time_ms();
+    MelSpectrogram mel;
+    {
+        QWEN3_TIMER("streaming.mel");
+        if (!log_mel_spectrogram(st.audio.data(), (int) st.audio.size(), mel_filters_, mel,
+                                 st.params.n_threads)) {
+            error_msg_ = "Failed to compute mel spectrogram";
+            return false;
+        }
+    }
+    st.t_mel_ms = get_time_ms() - t0;
+
+    // --- 2. encode ------------------------------------------------------------
+    t0 = get_time_ms();
+    std::vector<float> features;
+    if (!stream_encode_features(st, mel, features)) {
+        return false;
+    }
+    st.t_encode_ms = get_time_ms() - t0;
+
+    const int32_t hidden_size    = encoder_.get_text_hparams().hidden_size;
+    const int32_t n_audio_frames = (int32_t) (features.size() / (size_t) hidden_size);
+    if (n_audio_frames <= 0) {
+        return true;
+    }
+
+    // --- 3. decode ------------------------------------------------------------
+    t0 = get_time_ms();
+    const decoder_context ctx = plan_decoder_context(st, st.params.unfixed_token_num);
+
+    std::vector<int32_t> generated;
+    if (!stream_generate(st, features, n_audio_frames, ctx.prompt_prefix, generated)) {
+        return false;
+    }
+    st.t_decode_ms = get_time_ms() - t0;
+
+    // --- 4. commit ------------------------------------------------------------
+    // An empty generation means the decoder hit EOS straight away -- it heard nothing
+    // new. Rolling the unstable tail back and appending nothing would silently delete
+    // settled text, so in that case leave the transcript exactly as it was.
+    if (!generated.empty() || st.prev_tokens.empty()) {
+        std::vector<int32_t> updated_tokens(st.prev_tokens.begin(),
+                                            st.prev_tokens.begin() + ctx.n_settled);
+        updated_tokens.insert(updated_tokens.end(), generated.begin(), generated.end());
+        st.prev_tokens = std::move(updated_tokens);
+        stream_publish_text(st);
+    }
+
+    st.n_chunks_fed++;
+    stream_evict_windows(st, hidden_size);
+
+    return true;
 }
 
 bool load_audio_file(const std::string & path, std::vector<float> & samples, int & sample_rate) {

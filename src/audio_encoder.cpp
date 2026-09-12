@@ -320,26 +320,20 @@ static int compute_chunk_output_length(int chunk_len) {
     return len;
 }
 
-bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames, 
-                          std::vector<float> & output) {
-    QWEN3_TIMER("audio_encoding.total");
-    
-    if (!model_.ctx) {
-        error_msg_ = "Model not loaded";
-        return false;
-    }
-    
-    if (n_mel != model_.hparams.n_mel_bins) {
-        error_msg_ = "Mel bins mismatch: expected " + std::to_string(model_.hparams.n_mel_bins) + 
-                     ", got " + std::to_string(n_mel);
-        return false;
-    }
-    
+// Run the conv frontend over a mel FRAME RANGE, in 100-frame (1 second) chunks.
+// Chunks are independent in the reference implementation, so a range can be encoded
+// on its own -- this is what lets streaming encode one window at a time.
+//   mel_data     : full mel, laid out mel-major as mel_data[m * mel_stride + frame]
+//   frame_offset : first frame of the range
+//   n_frames_range: how many frames to encode
+bool AudioEncoder::conv_encode_range(const float * mel_data, int n_mel, int mel_stride,
+                                     int frame_offset, int n_frames_range,
+                                     std::vector<float> & conv_out) {
     const int n_window = 50;
     const int chunk_size = n_window * 2;
     const int n_state = model_.hparams.d_model;
     
-    int n_chunks = (n_frames + chunk_size - 1) / chunk_size;
+    int n_chunks = (n_frames_range + chunk_size - 1) / chunk_size;
     
     std::vector<int> chunk_lengths(n_chunks);
     std::vector<int> chunk_output_lengths(n_chunks);
@@ -347,14 +341,14 @@ bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames,
     
     for (int i = 0; i < n_chunks; ++i) {
         int start = i * chunk_size;
-        int end = std::min(start + chunk_size, n_frames);
+        int end = std::min(start + chunk_size, n_frames_range);
         chunk_lengths[i] = end - start;
         chunk_output_lengths[i] = compute_chunk_output_length(chunk_lengths[i]);
         total_output_frames += chunk_output_lengths[i];
     }
     
-    std::vector<float> all_conv_outputs;
-    all_conv_outputs.reserve(total_output_frames * n_state);
+    conv_out.clear();
+    conv_out.reserve(total_output_frames * n_state);
     
     for (int chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
         QWEN3_TIMER("audio_encoding.conv_chunk");
@@ -379,7 +373,7 @@ bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames,
         std::vector<float> chunk_mel(n_mel * chunk_len);
         for (int m = 0; m < n_mel; ++m) {
             for (int f = 0; f < chunk_len; ++f) {
-                chunk_mel[f + m * chunk_len] = mel_data[m * n_frames + chunk_start + f];
+                chunk_mel[f + m * chunk_len] = mel_data[m * mel_stride + frame_offset + chunk_start + f];
             }
         }
         
@@ -414,12 +408,94 @@ bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames,
             chunk_output[i] += chunk_pe[i];
         }
         
-        all_conv_outputs.insert(all_conv_outputs.end(), chunk_output.begin(), chunk_output.end());
+        conv_out.insert(conv_out.end(), chunk_output.begin(), chunk_output.end());
         
         ggml_backend_sched_reset(state_.sched);
     }
+
+    return true;
+}
+
+// Encoder tokens per attention window (window_aftercnn).
+//   compute_chunk_output_length(100) * (n_window_infer / 100) = 13 * 8 = 104 tokens = 8 s
+int AudioEncoder::window_tokens() const {
+    const int chunk_size = 100;
+    return compute_chunk_output_length(chunk_size) * (model_.hparams.n_window_infer / chunk_size);
+}
+
+// Streaming entry point: conv + transformer for ONE window, straight from a mel range.
+// A completed window never changes, so the caller caches the result and never redoes it.
+bool AudioEncoder::encode_window_from_mel(const float * mel_data, int n_mel, int mel_stride,
+                                          int frame_offset, int n_frames_range,
+                                          std::vector<float> & output) {
+    std::vector<float> conv_out;
+    if (!conv_encode_range(mel_data, n_mel, mel_stride, frame_offset, n_frames_range, conv_out)) {
+        return false;
+    }
+
+    const int n_state  = model_.hparams.d_model;
+    const int n_tokens = (int)(conv_out.size() / n_state);
+    if (n_tokens <= 0) {
+        output.clear();
+        return true;
+    }
+    if (n_tokens > window_tokens()) {
+        error_msg_ = "encode_window_from_mel: range spans more than one attention window";
+        return false;
+    }
+
+    return encode_transformer(conv_out.data(), n_tokens, output);
+}
+
+bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames, 
+                          std::vector<float> & output) {
+    QWEN3_TIMER("audio_encoding.total");
     
-    int64_t n_ctx = total_output_frames;
+    if (!model_.ctx) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+    
+    if (n_mel != model_.hparams.n_mel_bins) {
+        error_msg_ = "Mel bins mismatch: expected " + std::to_string(model_.hparams.n_mel_bins) + 
+                     ", got " + std::to_string(n_mel);
+        return false;
+    }
+    
+    const int chunk_size = 100;   // n_window(50) * 2 mel frames = 1 second
+    const int n_state    = model_.hparams.d_model;
+
+    std::vector<float> all_conv_outputs;
+    if (!conv_encode_range(mel_data, n_mel, n_frames, 0, n_frames, all_conv_outputs)) {
+        return false;
+    }
+    const int total_output_frames = (int)(all_conv_outputs.size() / n_state);
+    
+    // Block-diagonal windowed attention: windows are independent, so encode one at a time.
+    const int win_tokens = window_tokens();
+
+    output.clear();
+    for (int start = 0; start < total_output_frames; start += win_tokens) {
+        const int n_tok = std::min(win_tokens, total_output_frames - start);
+
+        std::vector<float> window_out;
+        if (!encode_transformer(all_conv_outputs.data() + (size_t)start * n_state, n_tok, window_out)) {
+            return false;
+        }
+        output.insert(output.end(), window_out.begin(), window_out.end());
+    }
+
+    return true;
+}
+
+// Run the encoder transformer over ONE attention window (n_tokens <= window size).
+// Qwen3-ASR's audio tower uses block-diagonal windowed attention, so windows are
+// independent: encoding a window in isolation is equivalent to masking it out of the
+// full sequence, and avoids both the O(n_ctx^2) mask buffer and the O(n_ctx^2) attention.
+bool AudioEncoder::encode_transformer(const float * conv_out, int n_tokens,
+                                      std::vector<float> & output) {
+    const int n_state = model_.hparams.d_model;
+    const int64_t n_ctx = n_tokens;
     
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_ASR_MAX_NODES + ggml_graph_overhead());
     
@@ -579,7 +655,7 @@ bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames,
         return false;
     }
     
-    ggml_backend_tensor_set(enc_input, all_conv_outputs.data(), 0, n_ctx * n_state * sizeof(float));
+    ggml_backend_tensor_set(enc_input, conv_out, 0, n_ctx * n_state * sizeof(float));
     
     {
         QWEN3_TIMER("audio_encoding.transformer");
@@ -610,6 +686,7 @@ bool AudioEncoder::encode(const float * mel_data, int n_mel, int n_frames,
     
     return true;
 }
+
 
 bool AudioEncoder::encode_no_chunk(const float * mel_data, int n_mel, int n_frames,
                                     std::vector<float> & output) {
