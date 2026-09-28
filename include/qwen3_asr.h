@@ -56,8 +56,9 @@ struct transcribe_result {
 // once and cached for the rest of the session.
 // ---------------------------------------------------------------------------
 struct streaming_params {
-    // Audio added per feed_audio() call, in seconds. Informational -- feed_audio()
-    // accepts any length; this is what the caller is expected to pace at.
+    // Audio per decode step, in seconds. feed_audio() accepts any length and buffers
+    // it, running one step per full chunk -- as the official streaming_transcribe()
+    // does -- so the cost does not depend on how often the caller sends audio.
     float chunk_size_sec = 2.0f;
 
     // Drop this many tokens off the tail of the previous output before reusing it
@@ -88,6 +89,9 @@ struct streaming_state {
     // Audio retained for windows [n_windows_dropped, ...). Older audio is evicted
     // along with its cached features.
     std::vector<float> audio;
+
+    // Audio received but not yet decoded: less than one chunk.
+    std::vector<float> pending;
 
     // Encoder features for completed windows [n_windows_dropped, n_windows_cached).
     std::vector<float> win_cache;
@@ -136,12 +140,13 @@ public:
     // Reset st and arm it with params. Safe to call on a used state.
     void init_streaming(streaming_state & st, const streaming_params & params = streaming_params());
 
-    // Append audio (16 kHz mono, [-1,1]) and re-decode. Updates st.text.
-    // n_samples may be 0 to re-decode without new audio.
+    // Append audio (16 kHz mono, [-1,1]) of any length. Runs one decode step, and
+    // updates st.text, for each full chunk_size_sec now buffered; a shorter remainder
+    // waits in st.pending for the next call.
     bool feed_audio(streaming_state & st, const float * samples, int n_samples);
 
-    // Final pass: one more normal step (rollback included) over the complete audio, so
-    // the unstable tail gets a last re-decode, then mark the session finished.
+    // Decode whatever is still in st.pending, however short, with a normal step
+    // (rollback included), then mark the session finished.
     bool finish_streaming(streaming_state & st);
 
     // Set progress callback

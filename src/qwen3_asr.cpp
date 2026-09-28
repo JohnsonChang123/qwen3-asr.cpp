@@ -387,9 +387,21 @@ bool Qwen3ASR::feed_audio(streaming_state & st, const float * samples, int n_sam
         return false;
     }
     if (samples != nullptr && n_samples > 0) {
-        st.audio.insert(st.audio.end(), samples, samples + n_samples);
+        st.pending.insert(st.pending.end(), samples, samples + n_samples);
     }
-    return streaming_step(st);
+
+    // One step per full chunk, as the official streaming_transcribe() does. Decoding on
+    // every call instead would tie the cost -- and the rollback cadence the defaults were
+    // measured with -- to however often the caller happens to send audio.
+    const size_t chunk = (size_t) std::max(1L, std::lround(st.params.chunk_size_sec * QWEN_SAMPLE_RATE));
+    while (st.pending.size() >= chunk) {
+        st.audio.insert(st.audio.end(), st.pending.begin(), st.pending.begin() + chunk);
+        st.pending.erase(st.pending.begin(), st.pending.begin() + chunk);
+        if (!streaming_step(st)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool Qwen3ASR::finish_streaming(streaming_state & st) {
@@ -401,11 +413,16 @@ bool Qwen3ASR::finish_streaming(streaming_state & st) {
         return true;
     }
 
-    // A normal step, deliberately: it rolls the unstable tail back and re-decodes it
-    // with the complete audio, which is the last chance to revise those tokens. Running
-    // the final pass with rollback disabled would freeze them and let it only append.
-    if (!streaming_step(st)) {
-        return false;
+    // Flush the remainder, however short, with a normal step: it rolls the unstable tail
+    // back and re-decodes it with the complete audio, the last chance to revise those
+    // tokens. With nothing pending the last step already saw all the audio, so -- as in
+    // the official finish_streaming_transcribe() -- there is nothing left to do.
+    if (!st.pending.empty()) {
+        st.audio.insert(st.audio.end(), st.pending.begin(), st.pending.end());
+        st.pending.clear();
+        if (!streaming_step(st)) {
+            return false;
+        }
     }
     st.finished = true;
     return true;
