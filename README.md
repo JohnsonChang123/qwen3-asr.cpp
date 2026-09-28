@@ -8,6 +8,7 @@ A high-performance C++ implementation of Qwen3-ASR and Qwen3-ForcedAligner using
 - **Forced Alignment**: Align reference text to audio with word-level timestamps
 - **Combined Pipeline** (`--transcribe-align`): Automatically runs ASR then alignment with auto language detection
 - **OpenAI-compatible API Server**: Serve `/v1/audio/transcriptions` for HTTP clients
+- **Streaming Transcription** (`--stream`): Feed audio incrementally and get partial transcripts as it arrives
 - **Flash Attention**: Uses `ggml_flash_attn_ext()` for fast decoding (3.7x speedup)
 - **Metal GPU Acceleration**: Optimized for Apple Silicon with dual CPU+Metal backend
 - **Accelerate/vDSP**: Highly optimized mel spectrogram computation (45x speedup)
@@ -139,6 +140,26 @@ The server accepts 16 kHz mono PCM WAV by default. Add `--convert` to convert up
 ```
 
 Supported `response_format` values are `json`, `text`, and `verbose_json`.
+
+### 5. Streaming Transcription
+
+Feed audio incrementally and get partial transcripts as it arrives:
+
+```bash
+./build/qwen3-asr-cli -m models/qwen3-asr-0.6b-q8_0.gguf -f audio.wav --stream -t 8
+```
+
+The CLI feeds the file in fixed-size chunks the way a live source would. Partial transcripts for each chunk go to stderr; the final transcript goes to stdout.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--chunk-sec <f>` | 2.0 | Audio added per step, in seconds |
+| `--unfixed-tokens <n>` | 5 | Tokens of the previous output re-decoded each step |
+| `--unfixed-chunks <n>` | 2 | Initial chunks decoded without a text prefix |
+| `--max-windows <n>` | 4 | Encoder windows kept (1 window = 8 s) |
+| `--max-prefix-tokens <n>` | 150 | Previous-text tokens fed back to the decoder; scale with `--max-windows` |
+
+Defaults follow the Qwen3-ASR Technical Report ([arXiv:2601.21337](https://arxiv.org/abs/2601.21337), §4.5). To stream from your own audio source, use `init_streaming()` / `feed_audio()` / `finish_streaming()` in `include/qwen3_asr.h`.
 
 ### Output Formats
 
