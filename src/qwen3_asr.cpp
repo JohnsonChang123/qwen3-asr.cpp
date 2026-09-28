@@ -546,9 +546,11 @@ bool Qwen3ASR::streaming_step(streaming_state & st) {
     decoder_.set_n_threads(st.params.n_threads);
 
     // --- 1. mel ---------------------------------------------------------------
-    // Recomputed in full every step. A frame only depends on its own 400-sample window,
-    // so every frame but the last is bit-identical to the previous step, and the ones
-    // that do move all sit inside the tail window, which is re-encoded anyway.
+    // Recomputed in full every step. Before normalisation a frame only depends on its own
+    // 400-sample window, but the normalisation clamps against the GLOBAL max over the
+    // retained buffer (Whisper's log_mel_spectrogram), so one loud new frame -- or evicting
+    // the loudest window -- shifts every frame's value. Cached windows keep the features
+    // they were encoded with, so streaming is close to, but not bit-identical with, offline.
     int64_t t0 = get_time_ms();
     MelSpectrogram mel;
     {

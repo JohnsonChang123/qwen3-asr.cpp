@@ -44,6 +44,7 @@ struct cli_params {
     int   stream_unfixed_tokens = 5;
     int   stream_unfixed_chunks = 2;
     int   stream_max_windows    = 4;
+    int   stream_max_prefix     = 150;
 };
 
 static void print_usage(const char * prog) {
@@ -61,12 +62,16 @@ static void print_usage(const char * prog) {
     fprintf(stderr, "  --tokens               Print token IDs\n");
     fprintf(stderr, "  --profile              Print detailed timing profile (requires QWEN3_ASR_TIMING build)\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "Forced Alignment:\n");
+    fprintf(stderr, "Streaming:\n");
     fprintf(stderr, "  --stream               Streaming mode: feed the file in chunks, decode incrementally\n");
     fprintf(stderr, "  --chunk-sec <f>        Streaming chunk size in seconds (default: 2.0)\n");
     fprintf(stderr, "  --unfixed-tokens <n>   Tokens rolled back each step (default: 5)\n");
     fprintf(stderr, "  --unfixed-chunks <n>   Cold-start chunks with no text prefix (default: 2)\n");
     fprintf(stderr, "  --max-windows <n>      Encoder windows kept; 1 window = 8s (default: 4)\n");
+    fprintf(stderr, "  --max-prefix-tokens <n> Previous-text tokens fed back to the decoder (default: 150)\n");
+    fprintf(stderr, "                         Scale with --max-windows: ~5 zh chars/s, so 4 windows = 32s ~ 150\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Forced Alignment:\n");
     fprintf(stderr, "  --align                Enable forced alignment mode\n");
     fprintf(stderr, "  --text <text>          Reference transcript for alignment\n");
     fprintf(stderr, "\n");
@@ -152,6 +157,9 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         } else if (strcmp(arg, "--max-windows") == 0) {
             if (++i >= argc) return false;
             params.stream_max_windows = atoi(argv[i]);
+        } else if (strcmp(arg, "--max-prefix-tokens") == 0) {
+            if (++i >= argc) return false;
+            params.stream_max_prefix = atoi(argv[i]);
         } else if (strcmp(arg, "--align") == 0) {
             params.align_mode = true;
         } else if (strcmp(arg, "-osrt") == 0 || strcmp(arg, "--output-srt") == 0) {
@@ -543,6 +551,7 @@ static int run_streaming(const cli_params & params) {
     sp.unfixed_token_num   = params.stream_unfixed_tokens;
     sp.unfixed_chunk_num   = params.stream_unfixed_chunks;
     sp.max_cached_windows  = params.stream_max_windows;
+    sp.max_prefix_tokens   = params.stream_max_prefix;
     sp.n_threads           = params.n_threads;
     sp.language            = params.language;
 

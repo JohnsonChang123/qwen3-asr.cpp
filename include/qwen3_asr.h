@@ -140,7 +140,8 @@ public:
     // n_samples may be 0 to re-decode without new audio.
     bool feed_audio(streaming_state & st, const float * samples, int n_samples);
 
-    // Final pass: decode the tail with no rollback and commit everything.
+    // Final pass: one more normal step (rollback included) over the complete audio, so
+    // the unstable tail gets a last re-decode, then mark the session finished.
     bool finish_streaming(streaming_state & st);
 
     // Set progress callback
