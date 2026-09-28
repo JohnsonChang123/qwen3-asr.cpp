@@ -10,6 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <chrono>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -353,6 +356,55 @@ static std::string extract_transcript(const std::string & asr_text) {
     return asr_text.substr(pos);
 }
 
+// ---------------------------------------------------------------------------
+// Streaming sessions
+//
+// Same protocol as the official Qwen3-ASR streaming demo (qwen-asr-demo-streaming,
+// qwen_asr/cli/demo_streaming.py), so clients written for it work unmodified:
+//
+//   POST /api/start?language=<opt>            -> {"session_id": "..."}
+//   POST /api/chunk?session_id=<sid>          body = raw float32 LE PCM @16 kHz
+//                                             -> {"text", "language", "is_final": false}
+//   POST /api/finish?session_id=<sid>         -> {"text", "language", "is_final": true}
+//   POST /api/reset?session_id=<sid>          -> {"ok": true}
+//
+// is_final and /api/reset are extensions; the official demo has neither. Chunks may be
+// any length: feed_audio() buffers and decodes once per 2 s, like the official server.
+//
+// Concurrency: many sessions may be open at once and each has its own
+// streaming_state, but Qwen3ASR itself is not reentrant (one encoder, one decoder,
+// one KV cache), so the actual inference stays serialised behind asr_mutex. A step
+// is ~0.25 s per 2 s of audio, so roughly 8 live streams fit before the server
+// saturates. Per-session mutexes stop two chunks for the SAME session from
+// interleaving and corrupting its buffers.
+// ---------------------------------------------------------------------------
+
+struct stream_session {
+    qwen3_asr::streaming_state st;
+    std::mutex mu;
+    std::chrono::steady_clock::time_point last_touch = std::chrono::steady_clock::now();
+};
+
+static constexpr size_t   MAX_STREAM_SESSIONS = 64;
+static constexpr int      SESSION_IDLE_TIMEOUT_SEC = 300;
+
+// Language as the official demo reports it (normalize_language_name in qwen_asr):
+// trimmed, "Chinese" rather than " Chinese", and "" when the model says "None".
+static std::string stream_language(const std::string & raw) {
+    std::string lang = lower_copy(normalize_language_token(raw));
+    if (lang.empty() || lang == "none") {
+        return "";
+    }
+    lang[0] = (char) std::toupper((unsigned char) lang[0]);
+    return lang;
+}
+
+static std::string query_value(const httplib::Request & req, const char * name,
+                               const std::string & fallback = "") {
+    auto it = req.params.find(name);
+    return it != req.params.end() ? it->second : fallback;
+}
+
 static std::string response_json(const std::string & raw_text) {
     const std::string text = extract_transcript(raw_text);
     return std::string("{\"text\":\"") + json_escape(text) + "\"}";
@@ -405,6 +457,13 @@ int main(int argc, char ** argv) {
         res.status = 204;
     });
 
+    // Preflight for the streaming endpoints. A browser page served from another origin
+    // sends one: the chunk body is application/octet-stream, which is not a CORS-simple
+    // content type.
+    server.Options(R"(/api/.*)", [](const httplib::Request &, httplib::Response & res) {
+        res.status = 204;
+    });
+
     server.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
         res.set_content(ready.load() ? "{\"status\":\"ok\"}" : "{\"status\":\"loading\"}", "application/json");
     });
@@ -417,8 +476,193 @@ int main(int argc, char ** argv) {
             "    file=@audio.wav\n"
             "    model=qwen3-asr\n"
             "    language=<optional>\n"
-            "    response_format=json|text|verbose_json\n";
+            "    response_format=json|text|verbose_json\n"
+            "\n"
+            "Streaming (same protocol as qwen-asr-demo-streaming):\n"
+            "  POST /api/start?language=<opt>      -> {\"session_id\":...}\n"
+            "  POST /api/chunk?session_id=<sid>    body = raw float32 LE PCM @16kHz\n"
+            "                                      -> {\"text\":...,\"language\":...}\n"
+            "  POST /api/finish?session_id=<sid>   -> {\"text\":...,\"language\":...}\n"
+            "  POST /api/reset?session_id=<sid>\n";
         res.set_content(body, "text/plain");
+    });
+
+    // --- streaming ---------------------------------------------------------
+    std::map<std::string, std::shared_ptr<stream_session>> sessions;
+    std::mutex sessions_mutex;
+    std::atomic<uint64_t> session_counter{0};
+
+    // Reap sessions the client never finished. Called on /api/start, which is the
+    // only place a new one can be added, so the map cannot grow without a sweep.
+    auto sweep_sessions = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = sessions.begin(); it != sessions.end(); ) {
+            const auto idle = std::chrono::duration_cast<std::chrono::seconds>(now - it->second->last_touch).count();
+            if (idle > SESSION_IDLE_TIMEOUT_SEC) {
+                it = sessions.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
+
+    auto find_session = [&](const httplib::Request & req, httplib::Response & res)
+            -> std::shared_ptr<stream_session> {
+        const std::string sid = query_value(req, "session_id");
+        if (sid.empty()) {
+            res.status = 400;
+            res.set_content(make_error_json("missing required query parameter: session_id"), "application/json");
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> lock(sessions_mutex);
+        auto it = sessions.find(sid);
+        if (it == sessions.end()) {
+            res.status = 404;
+            res.set_content(make_error_json("unknown session_id: " + sid), "application/json");
+            return nullptr;
+        }
+        return it->second;
+    };
+
+    server.Post("/api/start", [&](const httplib::Request & req, httplib::Response & res) {
+        auto session = std::make_shared<stream_session>();
+
+        qwen3_asr::streaming_params sp;
+        sp.n_threads = sparams.n_threads;
+        sp.language  = query_value(req, "language");
+
+        {
+            std::lock_guard<std::mutex> lock(asr_mutex);
+            asr.init_streaming(session->st, sp);
+        }
+
+        std::string sid;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            sweep_sessions();
+            if (sessions.size() >= MAX_STREAM_SESSIONS) {
+                res.status = 503;
+                res.set_content(make_error_json("too many open streaming sessions"), "application/json");
+                return;
+            }
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "s%06llu",
+                          (unsigned long long)(session_counter.fetch_add(1) + 1));
+            sid = buf;
+            sessions[sid] = session;
+        }
+
+        res.set_content(std::string("{\"session_id\":\"") + json_escape(sid) + "\"}", "application/json");
+    });
+
+    server.Post("/api/chunk", [&](const httplib::Request & req, httplib::Response & res) {
+        auto session = find_session(req, res);
+        if (!session) {
+            return;
+        }
+
+        // The official demo requires application/octet-stream. A missing header is let
+        // through, so minimal clients that post raw bytes without one still work.
+        const std::string content_type = lower_copy(req.get_header_value("Content-Type"));
+        if (!content_type.empty() && content_type.rfind("application/octet-stream", 0) != 0) {
+            res.status = 400;
+            res.set_content(make_error_json("expected Content-Type: application/octet-stream (raw float32 PCM)"),
+                            "application/json");
+            return;
+        }
+
+        if (req.body.size() % sizeof(float) != 0) {
+            res.status = 400;
+            res.set_content(make_error_json("body length must be a multiple of 4 (raw float32 PCM)"),
+                            "application/json");
+            return;
+        }
+
+        // memcpy rather than reinterpret_cast: std::string data carries no alignment
+        // guarantee, and unaligned float loads are UB.
+        const size_t n_samples = req.body.size() / sizeof(float);
+        std::vector<float> samples(n_samples);
+        if (n_samples > 0) {
+            std::memcpy(samples.data(), req.body.data(), req.body.size());
+        }
+
+        std::lock_guard<std::mutex> session_lock(session->mu);
+        session->last_touch = std::chrono::steady_clock::now();
+
+        bool ok = true;
+        std::string err;
+        {
+            std::lock_guard<std::mutex> lock(asr_mutex);
+            ok = asr.feed_audio(session->st, samples.data(), (int)n_samples);
+            if (!ok) {
+                err = asr.get_error();
+            }
+        }
+
+        if (!ok) {
+            res.status = 500;
+            res.set_content(make_error_json(err, "server_error"), "application/json");
+            return;
+        }
+
+        res.set_content(std::string("{\"text\":\"") + json_escape(extract_transcript(session->st.text)) +
+                        "\",\"language\":\"" + json_escape(stream_language(session->st.language)) +
+                        "\",\"is_final\":false}", "application/json");
+    });
+
+    server.Post("/api/finish", [&](const httplib::Request & req, httplib::Response & res) {
+        auto session = find_session(req, res);
+        if (!session) {
+            return;
+        }
+
+        std::string text;
+        std::string language;
+        bool ok = true;
+        std::string err;
+        {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            std::lock_guard<std::mutex> lock(asr_mutex);
+            ok = asr.finish_streaming(session->st);
+            if (ok) {
+                text     = session->st.text;
+                language = session->st.language;
+            } else {
+                err = asr.get_error();
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex);
+            sessions.erase(query_value(req, "session_id"));
+        }
+
+        if (!ok) {
+            res.status = 500;
+            res.set_content(make_error_json(err, "server_error"), "application/json");
+            return;
+        }
+
+        res.set_content(std::string("{\"text\":\"") + json_escape(extract_transcript(text)) +
+                        "\",\"language\":\"" + json_escape(stream_language(language)) +
+                        "\",\"is_final\":true}", "application/json");
+    });
+
+    server.Post("/api/reset", [&](const httplib::Request & req, httplib::Response & res) {
+        auto session = find_session(req, res);
+        if (!session) {
+            return;
+        }
+
+        qwen3_asr::streaming_params sp = session->st.params;
+        {
+            std::lock_guard<std::mutex> session_lock(session->mu);
+            std::lock_guard<std::mutex> lock(asr_mutex);
+            asr.init_streaming(session->st, sp);
+            session->last_touch = std::chrono::steady_clock::now();
+        }
+
+        res.set_content("{\"ok\":true}", "application/json");
     });
 
     server.Post("/v1/audio/transcriptions", [&](const httplib::Request & req, httplib::Response & res) {
@@ -523,6 +767,8 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "qwen3-asr server listening at http://%s:%d\n", sparams.host.c_str(), sparams.port);
     fprintf(stderr, "OpenAI-compatible endpoint: http://%s:%d/v1/audio/transcriptions\n",
+            sparams.host.c_str(), sparams.port);
+    fprintf(stderr, "streaming endpoints:        http://%s:%d/api/{start,chunk,finish,reset}\n",
             sparams.host.c_str(), sparams.port);
     if (sparams.convert_audio) {
         fprintf(stderr, "ffmpeg conversion enabled for uploaded audio\n");

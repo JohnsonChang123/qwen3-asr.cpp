@@ -161,6 +161,26 @@ The CLI feeds the file in fixed-size chunks the way a live source would. Partial
 
 Defaults follow the Qwen3-ASR Technical Report ([arXiv:2601.21337](https://arxiv.org/abs/2601.21337), §4.5). To stream from your own audio source, use `init_streaming()` / `feed_audio()` / `finish_streaming()` in `include/qwen3_asr.h`.
 
+**Over HTTP.** `qwen3-asr-server` (started as in §4) also exposes streaming endpoints, using the same protocol as the official Qwen3-ASR streaming demo ([`qwen-asr-demo-streaming`](https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/cli/demo_streaming.py)), so clients written for it work unchanged. `is_final` and `/api/reset` are extensions.
+
+```bash
+# raw float32 little-endian PCM, 16 kHz mono
+ffmpeg -i audio.wav -ar 16000 -ac 1 -f f32le audio.f32
+
+SID=$(curl -s -X POST http://127.0.0.1:8080/api/start | jq -r .session_id)
+
+curl -s -X POST "http://127.0.0.1:8080/api/chunk?session_id=$SID" \
+  -H "Content-Type: application/octet-stream" --data-binary @audio.f32
+# -> {"text":"...","language":"Chinese","is_final":false}
+
+curl -s -X POST "http://127.0.0.1:8080/api/finish?session_id=$SID"
+# -> {"text":"...","language":"Chinese","is_final":true}
+```
+
+- Each response carries the full transcript so far: replace the displayed text, don't append.
+- Chunks can be any length. The server buffers them and decodes once per 2 s (`chunk_size_sec`, currently fixed).
+- `POST /api/reset?session_id=<sid>` restarts a session. Idle sessions are dropped after 5 minutes.
+
 ### Output Formats
 
 **Transcription** outputs plain text:
